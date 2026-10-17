@@ -1,0 +1,110 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+#define WIFI_CHANNEL 6
+#define SERIAL_BAUD 921600
+#define MAX_FRAME 2500
+#define QUEUE_LENGTH 8
+
+#define MAGIC_1 0xA5
+#define MAGIC_2 0x5A
+
+typedef struct {
+  uint16_t len;
+  uint8_t data[MAX_FRAME];
+} frame_t;
+
+static QueueHandle_t frame_queue;
+
+
+static void sniffer_callback(
+    void *buf,
+    wifi_promiscuous_pkt_type_t type) {
+
+  if (buf == nullptr || frame_queue == nullptr) {
+    return;
+  }
+
+  if (type != WIFI_PKT_MGMT &&
+      type != WIFI_PKT_DATA &&
+      type != WIFI_PKT_CTRL) {
+    return;
+  }
+
+  const wifi_promiscuous_pkt_t *pkt =
+      (const wifi_promiscuous_pkt_t *)buf;
+
+  // Longitud de la trama recibida por el controlador Wi-Fi.
+  const uint16_t len = pkt->rx_ctrl.sig_len;
+
+  if (len < 10 || len > MAX_FRAME) {
+    return;
+  }
+
+  frame_t frame;
+  frame.len = len;
+  memcpy(frame.data, pkt->payload, len);
+
+  // Si la cola está llena, descartar la trama.
+  (void)xQueueSend(frame_queue, &frame, 0);
+}
+
+
+static void serial_sender_task(void *arg) {
+  frame_t frame;
+
+  for (;;) {
+    if (xQueueReceive(frame_queue, &frame,
+                      portMAX_DELAY) == pdTRUE) {
+      uint8_t header[4] = {
+        MAGIC_1, MAGIC_2,
+        (uint8_t)(frame.len & 0xFF),
+        (uint8_t)(frame.len >> 8)
+      };
+
+      Serial.write(header, sizeof(header));
+      Serial.write(frame.data, frame.len);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+
+  frame_queue = xQueueCreate(
+      QUEUE_LENGTH, sizeof(frame_t));
+
+  if (frame_queue == nullptr) {
+    while (true) delay(1000);
+  }
+
+  if (xTaskCreate(serial_sender_task, "serial_sender",
+                  4096, nullptr, 5, nullptr) != pdPASS) {
+    while (true) delay(1000);
+  }
+
+  if (!WiFi.mode(WIFI_STA)) {
+    while (true) delay(1000);
+  }
+
+  ESP_ERROR_CHECK(esp_wifi_set_channel(
+      WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE));
+
+  wifi_promiscuous_filter_t filter = {};
+  filter.filter_mask =
+      WIFI_PROMIS_FILTER_MASK_MGMT |
+      WIFI_PROMIS_FILTER_MASK_DATA |
+      WIFI_PROMIS_FILTER_MASK_CTRL;
+
+  ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filter));
+  ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(sniffer_callback));
+  ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+}
+
+void loop() {
+  delay(1000);
+}
